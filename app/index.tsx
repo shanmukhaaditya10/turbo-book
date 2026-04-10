@@ -2,12 +2,8 @@ import {
   View,
   Text,
   ScrollView,
-  Switch,
-  Pressable,
-  Alert,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import { useState, useMemo } from "react";
 
 import {
   useMultiOrderbook,
@@ -16,7 +12,6 @@ import {
   type OrderbookEntry,
   type OrderbookState,
 } from "../lib/orderbook-native";
-import { useOrderbook } from "../lib/orderbook";
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -28,34 +23,7 @@ const LABELS: Record<string, string> = {
 };
 const DEPTH = 7;
 
-// ── Single JS orderbook panel (3 separate WebSockets) ─────────────
-
-function JSBookPanel({ symbol }: { symbol: string }) {
-  const book = useOrderbook(symbol, "P0", DEPTH);
-  return <BookPanel label={LABELS[symbol]} book={book} mode="JS" />;
-}
-
-// ── Native multi-book consumer ─────────────────────────────────────
-
-function NativeBookPanel({
-  symbol,
-  books,
-}: {
-  symbol: string;
-  books: Record<string, OrderbookState>;
-}) {
-  const book = books[symbol] ?? {
-    bids: [],
-    asks: [],
-    spread: 0,
-    spreadPercent: 0,
-    connected: false,
-    perf: { updatesPerSec: 0, rendersPerSec: 0, totalUpdates: 0, avgGetTopLevelsUs: 0, avgFlushTimeUs: 0 },
-  };
-  return <BookPanel label={LABELS[symbol]} book={book} mode="NATIVE" />;
-}
-
-// ── Shared book panel ──────────────────────────────────────────────
+// ── Price row ──────────────────────────────────────────────────────
 
 function PriceRow({
   entry,
@@ -92,24 +60,21 @@ function PriceRow({
   );
 }
 
+// ── Book panel ─────────────────────────────────────────────────────
+
 function BookPanel({
   label,
   book,
-  mode,
 }: {
   label: string;
   book: OrderbookState;
-  mode: "JS" | "NATIVE";
 }) {
   const maxBidTotal = book.bids[book.bids.length - 1]?.total ?? 1;
   const maxAskTotal = book.asks[book.asks.length - 1]?.total ?? 1;
 
-  const perf = book.perf as any;
+  const perf = book.perf;
   const upsLabel = perf.updatesPerSec ?? 0;
-  const totalUp  = perf.totalUpdates ?? 0;
-  const jsTime   = mode === "JS"
-    ? ((perf.avgProcessTimeUs ?? 0) + (perf.avgFlushTimeUs ?? 0)).toFixed(0)
-    : ((perf.avgGetTopLevelsUs ?? 0) + (perf.avgFlushTimeUs ?? 0)).toFixed(0);
+  const latencyUs = ((perf.avgGetTopLevelsUs ?? 0) + (perf.avgFlushTimeUs ?? 0)).toFixed(0);
 
   return (
     <View
@@ -127,7 +92,7 @@ function BookPanel({
         <Text style={{ color: "#e2e8f0", fontWeight: "700", fontSize: 13 }}>{label}</Text>
         <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
           <Text style={{ color: "#94a3b8", fontSize: 10 }}>
-            {upsLabel} upd/s · {jsTime}μs
+            {upsLabel} upd/s · {latencyUs}μs
           </Text>
           <View style={{
             width: 7, height: 7, borderRadius: 4,
@@ -164,33 +129,29 @@ function BookPanel({
 
       {/* Footer */}
       <Text style={{ color: "#334155", fontSize: 8, marginTop: 4, textAlign: "right" }}>
-        {totalUp.toLocaleString()} total updates
+        {perf.totalUpdates.toLocaleString()} total updates
       </Text>
     </View>
   );
 }
 
-// ── Native container (one hook manages all 3 books) ───────────────
+// ── Books container ────────────────────────────────────────────────
 
-function NativeBooks() {
+function Books() {
   const books = useMultiOrderbook(SYMBOLS, DEPTH);
   return (
     <>
-      {SYMBOLS.map((sym) => (
-        <NativeBookPanel key={sym} symbol={sym} books={books} />
-      ))}
-    </>
-  );
-}
-
-// ── JS container (3 independent hooks = 3 WebSockets) ─────────────
-
-function JSBooks() {
-  return (
-    <>
-      {SYMBOLS.map((sym) => (
-        <JSBookPanel key={sym} symbol={sym} />
-      ))}
+      {SYMBOLS.map((sym) => {
+        const book = books[sym] ?? {
+          bids: [],
+          asks: [],
+          spread: 0,
+          spreadPercent: 0,
+          connected: false,
+          perf: { updatesPerSec: 0, rendersPerSec: 0, totalUpdates: 0, avgGetTopLevelsUs: 0, avgFlushTimeUs: 0 },
+        };
+        return <BookPanel key={sym} label={LABELS[sym]} book={book} />;
+      })}
     </>
   );
 }
@@ -198,8 +159,6 @@ function JSBooks() {
 // ── Root ───────────────────────────────────────────────────────────
 
 export default function App() {
-  const [useNative, setUseNative] = useState(true);
-
   return (
     <View style={{ flex: 1, backgroundColor: "#020817" }}>
       <StatusBar style="light" />
@@ -212,57 +171,14 @@ export default function App() {
           paddingBottom: 12,
           borderBottomWidth: 1,
           borderBottomColor: "#1e293b",
-          flexDirection: "row",
-          alignItems: "center",
-          justifyContent: "space-between",
         }}
       >
-        <View>
-          <Text style={{ color: "#f8fafc", fontSize: 18, fontWeight: "800" }}>
-            TurboBook
-          </Text>
-          <Text style={{ color: "#64748b", fontSize: 11, marginTop: 1 }}>
-            {SYMBOLS.map((s) => LABELS[s]).join(" · ")}
-          </Text>
-        </View>
-
-        {/* JS / NATIVE toggle */}
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <Text style={{ color: useNative ? "#475569" : "#22d3ee", fontSize: 12, fontWeight: "600" }}>
-            JS
-          </Text>
-          <Switch
-            value={useNative}
-            onValueChange={setUseNative}
-            thumbColor={useNative ? "#6366f1" : "#22d3ee"}
-            trackColor={{ false: "#1e3a5f", true: "#312e81" }}
-          />
-          <Text style={{ color: useNative ? "#818cf8" : "#475569", fontSize: 12, fontWeight: "600" }}>
-            NATIVE
-          </Text>
-        </View>
-      </View>
-
-      {/* Mode badge */}
-      <View style={{ paddingHorizontal: 16, paddingTop: 8 }}>
-        <View
-          style={{
-            backgroundColor: useNative ? "#1e1b4b" : "#0c2240",
-            borderRadius: 8,
-            padding: 8,
-            flexDirection: "row",
-            justifyContent: "space-between",
-          }}
-        >
-          <Text style={{ color: useNative ? "#818cf8" : "#38bdf8", fontSize: 11, fontWeight: "700" }}>
-            {useNative
-              ? "C++ TurboModule · 1 native WS · 3 engines"
-              : "Pure JS · 3 WebSockets · Map + sort per update"}
-          </Text>
-          <Text style={{ color: "#475569", fontSize: 10 }}>
-            depth {DEPTH}
-          </Text>
-        </View>
+        <Text style={{ color: "#f8fafc", fontSize: 20, fontWeight: "800" }}>
+          TurboBook
+        </Text>
+        <Text style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+          Real-time market depth · {SYMBOLS.map((s) => LABELS[s]).join(" · ")}
+        </Text>
       </View>
 
       {/* Books */}
@@ -270,7 +186,7 @@ export default function App() {
         style={{ flex: 1 }}
         contentContainerStyle={{ padding: 16, paddingBottom: 32 }}
       >
-        {useNative ? <NativeBooks /> : <JSBooks />}
+        <Books />
       </ScrollView>
     </View>
   );

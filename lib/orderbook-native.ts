@@ -201,20 +201,9 @@ export function useMultiOrderbook(
       });
     }, 1000);
 
-    // ── 30s benchmark report ──────────────────────────────────────
-    const reportInterval = setInterval(() => {
-      const lines = symbols.map((sym) => {
-        const t = engine.getTimings(sym);
-        const p = trackers.current[sym]?.getPerf(t.totalUpdates);
-        return `${sym}: ${t.totalUpdates} updates | ${p?.avgGetTopLevelsUs}μs JSI | ${p?.avgFlushTimeUs}μs flush`;
-      });
-      console.log(`\n[NATIVE BENCHMARK]\n${lines.join("\n")}`);
-    }, 30000);
-
     return () => {
       clearInterval(pollInterval);
       clearInterval(secInterval);
-      clearInterval(reportInterval);
       engine.disconnect();
     };
   }, [symbols.join(","), depth]);
