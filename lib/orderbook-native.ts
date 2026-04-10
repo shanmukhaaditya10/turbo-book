@@ -1,23 +1,13 @@
-/**
- * TurboModule multi-symbol orderbook hook.
- * ONE native WebSocket, N C++ engines, JS polls dirty state only.
- */
 import { useEffect, useRef, useState } from "react";
 import OrderbookEngine from "./orderbook-engine";
+
+// ── Types ──────────────────────────────────────────────────────────
 
 export type OrderbookEntry = {
   price: number;
   count: number;
   amount: number;
-  total: number;
-};
-
-export type SymbolPerf = {
-  updatesPerSec: number;
-  rendersPerSec: number;
-  totalUpdates: number;
-  avgGetTopLevelsUs: number;
-  avgFlushTimeUs: number;
+  total: number;  // cumulative size from best price to this level
 };
 
 export type OrderbookState = {
@@ -26,15 +16,11 @@ export type OrderbookState = {
   spread: number;
   spreadPercent: number;
   connected: boolean;
-  perf: SymbolPerf;
-};
-
-const EMPTY_PERF: SymbolPerf = {
-  updatesPerSec: 0,
-  rendersPerSec: 0,
-  totalUpdates: 0,
-  avgGetTopLevelsUs: 0,
-  avgFlushTimeUs: 0,
+  perf: {
+    updatesPerSec: number;
+    totalUpdates: number;
+    avgLatencyUs: number;  // avg time to fetch + parse levels from native (microseconds)
+  };
 };
 
 const EMPTY_STATE: OrderbookState = {
@@ -43,99 +29,58 @@ const EMPTY_STATE: OrderbookState = {
   spread: 0,
   spreadPercent: 0,
   connected: false,
-  perf: EMPTY_PERF,
+  perf: { updatesPerSec: 0, totalUpdates: 0, avgLatencyUs: 0 },
 };
-
-// ── Per-symbol tracker ─────────────────────────────────────────────
-
-class SymbolTracker {
-  private getTopLevelsTimes: number[] = [];
-  private flushTimes: number[]        = [];
-  private renderCount   = 0;
-  private secRenderCount = 0;
-  private rpsHistory: number[] = [];
-  private prevUpdates = 0;
-  private upsHistory: number[] = [];
-
-  private push(arr: number[], v: number) {
-    arr.push(v);
-    if (arr.length > 200) arr.shift();
-  }
-
-  private avg(arr: number[]): number {
-    if (!arr.length) return 0;
-    return arr.reduce((s, v) => s + v, 0) / arr.length;
-  }
-
-  recordGetTopLevels(us: number) { this.push(this.getTopLevelsTimes, us); }
-  recordFlush(us: number)        { this.push(this.flushTimes, us); }
-
-  tickRender() {
-    this.renderCount++;
-    this.secRenderCount++;
-  }
-
-  tickSecond(currentUpdates: number) {
-    this.upsHistory.push(currentUpdates - this.prevUpdates);
-    this.rpsHistory.push(this.secRenderCount);
-    this.prevUpdates   = currentUpdates;
-    this.secRenderCount = 0;
-    if (this.upsHistory.length > 30) this.upsHistory.shift();
-    if (this.rpsHistory.length > 30) this.rpsHistory.shift();
-  }
-
-  getPerf(totalUpdates: number): SymbolPerf {
-    return {
-      updatesPerSec:     this.upsHistory[this.upsHistory.length - 1] ?? 0,
-      rendersPerSec:     this.rpsHistory[this.rpsHistory.length - 1] ?? 0,
-      totalUpdates,
-      avgGetTopLevelsUs: Math.round(this.avg(this.getTopLevelsTimes) * 100) / 100,
-      avgFlushTimeUs:    Math.round(this.avg(this.flushTimes)        * 100) / 100,
-    };
-  }
-}
-
-// ── Multi-symbol hook ──────────────────────────────────────────────
 
 export type MultiOrderbookState = Record<string, OrderbookState>;
 
-export function useMultiOrderbook(
-  symbols: string[],
-  depth = 10
-): MultiOrderbookState {
-  const emptyState = Object.fromEntries(symbols.map((s) => [s, EMPTY_STATE]));
-  const [state, setState] = useState<MultiOrderbookState>(emptyState);
-  const lastUpdateCounts = useRef<Record<string, number>>({});
-  const trackers = useRef<Record<string, SymbolTracker>>({});
+// ── Hook ───────────────────────────────────────────────────────────
+// Manages live orderbooks for multiple symbols using one native WebSocket.
+// JS polls the C++ engine every 50ms — only re-renders when new data arrives.
+
+export function useMultiOrderbook(symbols: string[], depth = 10): MultiOrderbookState {
+  const [state, setState] = useState<MultiOrderbookState>(
+    Object.fromEntries(symbols.map((s) => [s, EMPTY_STATE]))
+  );
+
+  // Track the last update count we rendered — skip re-render if unchanged
+  const lastCounts = useRef<Record<string, number>>({});
+
+  // Rolling latency average per symbol (last 60 samples)
+  const latencySamples = useRef<Record<string, number[]>>({});
+
+  // Updates-per-second tracking
+  const prevCounts  = useRef<Record<string, number>>({});
+  const upsRef      = useRef<Record<string, number>>({});
 
   useEffect(() => {
     if (!OrderbookEngine) {
-      console.error("[orderbook-native] TurboModule not available!");
+      console.error("[TurboBook] TurboModule not available");
       return;
     }
 
-    const engine = OrderbookEngine;
-
-    // Init per-symbol trackers and dirty counters
+    // Reset tracking state for each symbol
     symbols.forEach((sym) => {
-      lastUpdateCounts.current[sym] = 0;
-      trackers.current[sym] = new SymbolTracker();
+      lastCounts.current[sym]     = 0;
+      prevCounts.current[sym]     = 0;
+      upsRef.current[sym]         = 0;
+      latencySamples.current[sym] = [];
     });
 
-    engine.connectMulti(symbols, "P0", "F0", "25");
+    OrderbookEngine.connectMulti(symbols, "P0", "F0", "25");
 
-    // ── 50ms poll — dirty check per symbol ───────────────────────
-    const pollInterval = setInterval(() => {
+    // ── Poll every 50ms ────────────────────────────────────────────
+    // For each symbol: check if totalUpdates changed. If yes, fetch levels and re-render.
+    const poll = setInterval(() => {
       const updates: Partial<MultiOrderbookState> = {};
       let anyChanged = false;
 
       for (const sym of symbols) {
-        const timings = engine.getTimings(sym);
-        const connected = engine.isConnected(sym) as unknown as boolean;
-        const tracker = trackers.current[sym];
+        const { totalUpdates } = OrderbookEngine!.getTimings(sym);
+        const connected = OrderbookEngine!.isConnected(sym) as unknown as boolean;
 
-        if (timings.totalUpdates === lastUpdateCounts.current[sym]) {
-          // No new data — update connected flag only if it changed
+        // Nothing new — just sync the connected dot if it changed
+        if (totalUpdates === lastCounts.current[sym]) {
           setState((prev) => {
             if (prev[sym]?.connected === connected) return prev;
             return { ...prev, [sym]: { ...prev[sym], connected } };
@@ -143,68 +88,59 @@ export function useMultiOrderbook(
           continue;
         }
 
-        lastUpdateCounts.current[sym] = timings.totalUpdates;
+        lastCounts.current[sym] = totalUpdates;
         anyChanged = true;
 
+        // Time the JSI call so we can show it in the UI
         const t0   = performance.now();
-        const flat = engine.getTopLevels(sym, depth) as unknown as number[];
-        const getTopLevelsUs = (performance.now() - t0) * 1000;
-        tracker.recordGetTopLevels(getTopLevelsUs);
+        const flat = OrderbookEngine!.getTopLevels(sym, depth) as unknown as number[];
+        const latencyUs = (performance.now() - t0) * 1000;
 
-        const bidCount = flat[0] as unknown as number;
-        const askCount = flat[1] as unknown as number;
+        // Track a rolling average of the last 60 latency samples
+        const samples = latencySamples.current[sym];
+        samples.push(latencyUs);
+        if (samples.length > 60) samples.shift();
+        const avgLatencyUs = samples.reduce((a, b) => a + b, 0) / samples.length;
+
+        // Parse flat array: [bidCount, askCount, price, count, amount, total, ...]
+        const bidCount = flat[0];
+        const askCount = flat[1];
         const bids: OrderbookEntry[] = [];
         const asks: OrderbookEntry[] = [];
-        let offset = 2;
-        for (let i = 0; i < bidCount; i++, offset += 4) {
-          bids.push({
-            price: flat[offset] as unknown as number,
-            count: flat[offset + 1] as unknown as number,
-            amount: flat[offset + 2] as unknown as number,
-            total: flat[offset + 3] as unknown as number,
-          });
-        }
-        for (let i = 0; i < askCount; i++, offset += 4) {
-          asks.push({
-            price: flat[offset] as unknown as number,
-            count: flat[offset + 1] as unknown as number,
-            amount: flat[offset + 2] as unknown as number,
-            total: flat[offset + 3] as unknown as number,
-          });
-        }
+        let i = 2;
+        for (let b = 0; b < bidCount; b++, i += 4)
+          bids.push({ price: flat[i], count: flat[i+1], amount: flat[i+2], total: flat[i+3] });
+        for (let a = 0; a < askCount; a++, i += 4)
+          asks.push({ price: flat[i], count: flat[i+1], amount: flat[i+2], total: flat[i+3] });
 
         const bestBid = bids[0]?.price ?? 0;
         const bestAsk = asks[0]?.price ?? 0;
         const spread  = bestAsk - bestBid;
         const mid     = (bestBid + bestAsk) / 2;
 
-        tracker.tickRender();
-        const t1 = performance.now();
         updates[sym] = {
           bids, asks, spread, connected,
           spreadPercent: mid > 0 ? (spread / mid) * 100 : 0,
-          perf: tracker.getPerf(timings.totalUpdates),
+          perf: { updatesPerSec: upsRef.current[sym], totalUpdates, avgLatencyUs },
         };
-        tracker.recordFlush((performance.now() - t1) * 1000);
       }
 
-      if (anyChanged) {
-        setState((prev) => ({ ...prev, ...updates }));
-      }
+      if (anyChanged) setState((prev) => ({ ...prev, ...updates }));
     }, 50);
 
-    // ── Per-second UPS tracking ───────────────────────────────────
-    const secInterval = setInterval(() => {
+    // ── Count updates per second ───────────────────────────────────
+    const upsTick = setInterval(() => {
       symbols.forEach((sym) => {
-        const timings = engine.getTimings(sym);
-        trackers.current[sym]?.tickSecond(timings.totalUpdates);
+        const { totalUpdates } = OrderbookEngine!.getTimings(sym);
+        upsRef.current[sym]  = totalUpdates - prevCounts.current[sym];
+        prevCounts.current[sym] = totalUpdates;
       });
     }, 1000);
 
     return () => {
-      clearInterval(pollInterval);
-      clearInterval(secInterval);
-      engine.disconnect();
+      clearInterval(poll);
+      clearInterval(upsTick);
+      OrderbookEngine!.disconnect();
     };
   }, [symbols.join(","), depth]);
 
@@ -221,6 +157,5 @@ export function formatPrice(price: number): string {
 }
 
 export function formatAmount(amount: number): string {
-  if (amount >= 1) return amount.toFixed(4);
-  return amount.toFixed(6);
+  return amount >= 1 ? amount.toFixed(4) : amount.toFixed(6);
 }
