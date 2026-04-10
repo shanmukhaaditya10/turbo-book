@@ -8,7 +8,7 @@ import {
   formatTotal,
   getPerfTracker,
   type OrderbookEntry,
-} from "../lib/orderbook";
+} from "../lib/orderbook-native";
 
 const DEPTH = 20;
 
