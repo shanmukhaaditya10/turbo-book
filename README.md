@@ -1,50 +1,120 @@
-# Welcome to your Expo app 👋
+# TurboBook
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A real-time cryptocurrency market depth viewer built with React Native, Expo, and a custom C++ TurboModule. Streams live orderbook data from Bitfinex via a single native WebSocket, processing updates in C++ and surfacing them to JS through the React Native New Architecture (JSI).
 
-## Get started
+---
 
-1. Install dependencies
+## Screenshot
 
-   ```bash
-   npm install
-   ```
+<p align="center">
+  <img src="./assets/images/screenshot.png" width="320" alt="TurboBook screenshot" />
+</p>
 
-2. Start the app
+---
 
-   ```bash
-   npx expo start
-   ```
+## Tech Stack
 
-In the output, you'll find options to open the app in a
+| Layer | Technology |
+|-------|-----------|
+| Framework | React Native 0.79 + Expo SDK 54 |
+| Architecture | New Architecture (Hermes + TurboModules + JSI) |
+| Native module | C++ TurboModule via codegen (`RCT_EXPORT_MODULE`) |
+| WebSocket | `NSURLSessionWebSocketTask` (native ObjC, not JS) |
+| Orderbook engine | `std::map` with O(log n) insert/delete |
+| JS bridge | JSI synchronous call — no async bridge overhead |
+| Language | TypeScript + C++20 + Objective-C++ |
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+---
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+## Architecture
 
-## Get a fresh project
+```
+Bitfinex WSS
+     │
+     ▼
+NSURLSessionWebSocketTask          ← single native WS connection
+     │
+     ▼  (background thread)
+NativeOrderbookEngine.mm
+  ├── chanId → symbol routing
+  └── per-symbol C++ OrderbookEngine
+        ├── processSnapshot()      ← initial 25-level snapshot
+        └── processDelta()         ← price-level deltas
+              └── std::map<double, Level>  (bids desc, asks asc)
 
-When you're ready, run:
-
-```bash
-npm run reset-project
+JS thread (50ms poll via setInterval)
+  ├── getTimings(sym)              ← cheap: reads totalUpdates counter
+  │     └── dirty? skip render
+  └── getTopLevels(sym, depth)     ← JSI synchronous call
+        └── flat number[]  [bidCount, askCount, p,c,a,t...]
+              └── parsed into OrderbookEntry[] → React state → render
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+### Why a C++ TurboModule?
 
-## Learn more
+In a standard React Native app, WebSocket messages arrive on the JS thread. Parsing JSON, maintaining a price-level map, and sorting on every update competes directly with rendering. With a TurboModule:
 
-To learn more about developing your project with Expo, look at the following resources:
+- The native WS runs on a background thread — the JS thread is never blocked by incoming market data
+- A single connection fans out to multiple symbol engines independently
+- `getTopLevels()` is a synchronous JSI call (~2–5μs C++ traversal + ~50μs JSI boxing for 7 levels) — no async round-trip
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+---
 
-## Join the community
+## Getting Started
 
-Join our community of developers creating universal apps.
+### Prerequisites
+- Xcode 15+
+- CocoaPods
+- Node 18+
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+### Install
+```bash
+git clone https://github.com/yourusername/turbobook
+cd turbobook
+npm install
+cd ios && pod install && cd ..
+```
+
+### Run
+```bash
+npx expo run:ios
+```
+
+> Requires iOS 16+ (physical device or simulator). The TurboModule is iOS-only.
+
+---
+
+## Project Structure
+
+```
+turbobook/
+├── app/
+│   └── index.tsx                     # Main screen — 3 live orderbook panels
+├── lib/
+│   ├── orderbook-native.ts           # useMultiOrderbook() hook — polls TurboModule
+│   ├── orderbook-engine/
+│   │   └── NativeOrderbookEngine.ts  # Codegen TypeScript spec
+│   └── orderbook.ts                  # Pure JS reference implementation
+└── cpp/
+    ├── OrderbookEngine.h/.cpp         # C++ price-level engine (std::map, CRC32)
+    ├── NativeOrderbookEngine.mm       # ObjC++ TurboModule implementation
+    └── OrderbookEngine.podspec
+```
+
+---
+
+## Key Implementation Details
+
+**Dirty-flag polling** — JS polls `getTimings()` every 50ms (cheap scalar read). Only calls `getTopLevels()` (JSI array allocation) when `totalUpdates` has changed. Eliminates wasted renders when the market is quiet.
+
+**Flat array layout** — `getTopLevels()` returns `[bidCount, askCount, price, count, amount, total, ...]` as a single `NSArray<NSNumber *>`. Avoids nested array allocation overhead vs returning objects.
+
+**Exponential backoff** — WS reconnects at 2s → 4s → 8s → 16s → 30s (capped). Resets on any successful subscription to avoid penalising brief disconnects.
+
+**Thread safety** — `NSLock` protects `_engines` and `_stats` shared between the WS receive thread and JS poll thread. `std::shared_ptr` copied under lock so the lock is released before entering C++ (which has its own `std::mutex`).
+
+---
+
+## License
+
+MIT
