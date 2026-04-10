@@ -1,34 +1,25 @@
 import { TurboModule, TurboModuleRegistry } from "react-native";
 
 export interface Spec extends TurboModule {
-  /**
-   * Open ONE native WebSocket and subscribe to multiple symbols simultaneously.
-   * symbols e.g. ["tBTCUSD", "tETHUSD", "tXRPUSD"]
-   */
+  /** Open one native WebSocket and subscribe to multiple symbols. */
   connectMulti(symbols: string[], prec: string, freq: string, len: string): void;
 
   /** Close the WebSocket and tear down all engines. */
   disconnect(): void;
 
   /**
-   * Get top N levels for a specific symbol as a flat array.
-   * Format: [bidCount, askCount, p,c,a,t per bid..., p,c,a,t per ask...]
+   * Get the top N price levels for a symbol.
+   * Returns a flat array: [bidCount, askCount, price, count, amount, total, ...]
    */
   getTopLevels(symbol: string, n: number): number[];
 
   /**
-   * Internal timing breakdown for a specific symbol.
-   * mapTraversalUs: C++ std::map iteration time
-   * arrayBuildUs:   ObjC NSMutableArray construction time
-   * totalUpdates:   cumulative WS updates for this symbol
+   * Returns how many updates a symbol has received.
+   * JS uses totalUpdates as a cheap dirty check before calling getTopLevels.
    */
-  getTimings(symbol: string): {
-    mapTraversalUs: number;
-    arrayBuildUs: number;
-    totalUpdates: number;
-  };
+  getTimings(symbol: string): { totalUpdates: number };
 
-  /** True if this symbol is subscribed and receiving data. */
+  /** True if this symbol has an active subscription. */
   isConnected(symbol: string): boolean;
 }
 

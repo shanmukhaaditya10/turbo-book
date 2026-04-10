@@ -72,9 +72,7 @@ function BookPanel({
   const maxBidTotal = book.bids[book.bids.length - 1]?.total ?? 1;
   const maxAskTotal = book.asks[book.asks.length - 1]?.total ?? 1;
 
-  const perf = book.perf;
-  const upsLabel = perf.updatesPerSec ?? 0;
-  const latencyUs = ((perf.avgGetTopLevelsUs ?? 0) + (perf.avgFlushTimeUs ?? 0)).toFixed(0);
+  const { updatesPerSec, totalUpdates, avgLatencyUs } = book.perf;
 
   return (
     <View
@@ -92,7 +90,7 @@ function BookPanel({
         <Text style={{ color: "#e2e8f0", fontWeight: "700", fontSize: 13 }}>{label}</Text>
         <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
           <Text style={{ color: "#94a3b8", fontSize: 10 }}>
-            {upsLabel} upd/s · {latencyUs}μs
+            {updatesPerSec} upd/s · {avgLatencyUs.toFixed(0)}μs
           </Text>
           <View style={{
             width: 7, height: 7, borderRadius: 4,
@@ -129,7 +127,7 @@ function BookPanel({
 
       {/* Footer */}
       <Text style={{ color: "#334155", fontSize: 8, marginTop: 4, textAlign: "right" }}>
-        {perf.totalUpdates.toLocaleString()} total updates
+        {totalUpdates.toLocaleString()} total updates
       </Text>
     </View>
   );

@@ -1,68 +1,74 @@
 #import "NativeOrderbookEngine.h"
 #include "OrderbookEngine.h"
-#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_map>
 
-// ── Per-symbol stats ──────────────────────────────────────────────
-
-struct SymbolStats {
-  int64_t lastMapTraversalUs = 0;
-  int64_t lastArrayBuildUs   = 0;
-  int64_t totalUpdates       = 0;
-  bool    subscribed         = false;
-};
+// ─────────────────────────────────────────────────────────────────────────────
+// NativeOrderbookEngine
+//
+// This is the React Native TurboModule. It sits between JavaScript and C++.
+//
+// Responsibilities:
+//   1. Open ONE native WebSocket to Bitfinex
+//   2. Subscribe to multiple symbols (BTC, ETH, XRP) on that single connection
+//   3. Route incoming messages to the right C++ engine by channel ID
+//   4. Let JS poll for the latest data via JSI (synchronous, no bridge overhead)
+// ─────────────────────────────────────────────────────────────────────────────
 
 @implementation NativeOrderbookEngine {
-  // One C++ engine per symbol (shared_ptr so we can safely release the lock
-  // before calling into C++, which has its own internal mutex)
+  // One C++ orderbook engine per symbol
   std::unordered_map<std::string, std::shared_ptr<turbobook::OrderbookEngine>> _engines;
-  std::unordered_map<std::string, SymbolStats> _stats;
 
-  // WS receive thread only — no lock needed (sequential callbacks)
+  // Tracks how many updates each symbol has received (used for dirty-flag polling)
+  std::unordered_map<std::string, int64_t> _updateCounts;
+
+  // Bitfinex sends a channel ID (chanId) when you subscribe.
+  // We use this to know which symbol an incoming message belongs to.
   std::unordered_map<int64_t, std::string> _chanIdToSymbol;
 
-  // WebSocket
+  // Tracks whether each symbol has an active subscription
+  std::unordered_map<std::string, bool> _connected;
+
+  // Native WebSocket (Apple's API, runs on a background thread automatically)
   NSURLSession              *_session;
   NSURLSessionWebSocketTask *_wsTask;
 
-  // Connection parameters (set by connectMulti:, immutable until next call)
+  // Connection settings (set by connectMulti, used again on reconnect)
   NSArray<NSString *> *_symbols;
   NSString *_prec, *_freq, *_len;
 
+  // Reconnect state
   BOOL      _disconnecting;
-  NSInteger _reconnectDelay;
+  NSInteger _reconnectDelay;  // seconds, doubles on each failure up to 30s
 
-  // Protects: _engines, _stats, _disconnecting, _reconnectDelay
-  NSLock *_stateLock;
+  // Lock protecting shared state accessed from both the WS thread and JS thread
+  NSLock *_lock;
 }
 
 RCT_EXPORT_MODULE(OrderbookEngine)
 
-// ── Init ──────────────────────────────────────────────────────────
+// ── Setup ──────────────────────────────────────────────────────────────────
 
 - (instancetype)init {
   if (self = [super init]) {
-    _stateLock      = [[NSLock alloc] init];
+    _lock           = [[NSLock alloc] init];
     _reconnectDelay = 2;
     _disconnecting  = NO;
-
-    NSURLSessionConfiguration *cfg =
-        [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    _session = [NSURLSession sessionWithConfiguration:cfg];
+    _session = [NSURLSession sessionWithConfiguration:
+        NSURLSessionConfiguration.defaultSessionConfiguration];
   }
   return self;
 }
 
-// ── connectMulti ──────────────────────────────────────────────────
+// ── JS-callable methods ────────────────────────────────────────────────────
 
+// Called by JS to start streaming. Opens one WebSocket for all symbols.
 - (void)connectMulti:(NSArray<NSString *> *)symbols
                 prec:(NSString *)prec
                 freq:(NSString *)freq
                  len:(NSString *)len {
-  [_stateLock lock];
+  [_lock lock];
   _symbols        = symbols;
   _prec           = prec;
   _freq           = freq;
@@ -70,60 +76,57 @@ RCT_EXPORT_MODULE(OrderbookEngine)
   _disconnecting  = NO;
   _reconnectDelay = 2;
 
+  // Create a fresh C++ engine for each symbol
   _engines.clear();
-  _stats.clear();
+  _updateCounts.clear();
+  _connected.clear();
   for (NSString *sym in symbols) {
     std::string s = sym.UTF8String;
-    _engines[s] = std::make_shared<turbobook::OrderbookEngine>();
-    _stats[s]   = SymbolStats{};
+    _engines[s]      = std::make_shared<turbobook::OrderbookEngine>();
+    _updateCounts[s] = 0;
+    _connected[s]    = false;
   }
-  [_stateLock unlock];
+  [_lock unlock];
 
-  // WS receive thread: reset channel map
   _chanIdToSymbol.clear();
-
-  [self _openSocket];
+  [self openSocket];
 }
 
-// ── disconnect ────────────────────────────────────────────────────
-
+// Called by JS to stop streaming and clean up.
 - (void)disconnect {
-  [_stateLock lock];
+  [_lock lock];
   _disconnecting = YES;
-  for (auto &kv : _stats) kv.second.subscribed = false;
-  [_stateLock unlock];
+  for (auto &kv : _connected) kv.second = false;
+  [_lock unlock];
 
   [_wsTask cancel];
   _wsTask = nil;
 
-  [_stateLock lock];
+  [_lock lock];
   _engines.clear();
-  [_stateLock unlock];
+  [_lock unlock];
 
   _chanIdToSymbol.clear();
 }
 
-// ── getTopLevels ──────────────────────────────────────────────────
-
+// Returns the top N price levels for a symbol as a flat array.
+// Format: [bidCount, askCount, price, count, amount, total, price, count, ...]
+// Flat array is faster than nested objects across the JS bridge.
 - (NSArray *)getTopLevels:(NSString *)symbol n:(double)n {
   std::string sym = symbol.UTF8String;
 
-  [_stateLock lock];
+  // Copy the shared_ptr under lock, then call C++ outside the lock
+  [_lock lock];
   auto it = _engines.find(sym);
   std::shared_ptr<turbobook::OrderbookEngine> engine;
   if (it != _engines.end()) engine = it->second;
-  [_stateLock unlock];
+  [_lock unlock];
 
   if (!engine) return @[];
 
-  // C++ map traversal — timed inside OrderbookEngine::getTopLevels
-  auto top = engine->getTopLevels(static_cast<int>(n));
+  auto top = engine->getTopLevels((int)n);
 
-  // Build flat array: [bidCount, askCount, p,c,a,t per level...]
-  auto t0 = std::chrono::steady_clock::now();
-
-  NSUInteger capacity = 2 + (top.bids.size() + top.asks.size()) * 4;
-  NSMutableArray *flat = [NSMutableArray arrayWithCapacity:capacity];
+  NSMutableArray *flat = [NSMutableArray array];
   [flat addObject:@(top.bids.size())];
   [flat addObject:@(top.asks.size())];
   for (const auto &l : top.bids) {
@@ -138,87 +141,66 @@ RCT_EXPORT_MODULE(OrderbookEngine)
     [flat addObject:@(l.amount)];
     [flat addObject:@(l.total)];
   }
-
-  auto t1 = std::chrono::steady_clock::now();
-  int64_t arrayBuildUs =
-      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-
-  [_stateLock lock];
-  auto &stats            = _stats[sym];
-  stats.lastMapTraversalUs = top.traversalUs;
-  stats.lastArrayBuildUs   = arrayBuildUs;
-  [_stateLock unlock];
-
   return flat;
 }
 
-// ── getTimings ────────────────────────────────────────────────────
-
+// Returns how many updates a symbol has received.
+// JS uses this as a cheap "has anything changed?" check before calling getTopLevels.
 - (NSDictionary *)getTimings:(NSString *)symbol {
   std::string sym = symbol.UTF8String;
-  [_stateLock lock];
-  auto it = _stats.find(sym);
-  SymbolStats s = (it != _stats.end()) ? it->second : SymbolStats{};
-  [_stateLock unlock];
-  return @{
-    @"mapTraversalUs": @(s.lastMapTraversalUs),
-    @"arrayBuildUs":   @(s.lastArrayBuildUs),
-    @"totalUpdates":   @(s.totalUpdates),
-  };
+  [_lock lock];
+  int64_t count = _updateCounts.count(sym) ? _updateCounts[sym] : 0;
+  [_lock unlock];
+  return @{ @"totalUpdates": @(count) };
 }
 
-// ── isConnected ───────────────────────────────────────────────────
-
+// Returns YES if this symbol has an active Bitfinex subscription.
 - (NSNumber *)isConnected:(NSString *)symbol {
   std::string sym = symbol.UTF8String;
-  [_stateLock lock];
-  auto it = _stats.find(sym);
-  bool connected = (it != _stats.end()) && it->second.subscribed;
-  [_stateLock unlock];
-  return @(connected);
+  [_lock lock];
+  bool ok = _connected.count(sym) && _connected[sym];
+  [_lock unlock];
+  return @(ok);
 }
 
-// ── WebSocket internals ───────────────────────────────────────────
+// ── WebSocket ──────────────────────────────────────────────────────────────
 
-- (void)_openSocket {
-  [_stateLock lock];
+- (void)openSocket {
+  [_lock lock];
   BOOL shouldStop = _disconnecting;
-  [_stateLock unlock];
+  [_lock unlock];
   if (shouldStop) return;
 
   NSURL *url = [NSURL URLWithString:@"wss://api-pub.bitfinex.com/ws/2"];
-  _wsTask = [_session webSocketTaskWithRequest:[NSURLRequest requestWithURL:url]];
-  [self _receiveNext];
+  _wsTask = [_session webSocketTaskWithURL:url];
+  [self receiveNextMessage];
   [_wsTask resume];
-  NSLog(@"[ws-native] connecting for %lu symbols...", (unsigned long)_symbols.count);
 }
 
-- (void)_receiveNext {
+// Receives messages one at a time (Apple's API requires calling this again after each message)
+- (void)receiveNextMessage {
   __weak NativeOrderbookEngine *weakSelf = self;
-  [_wsTask receiveMessageWithCompletionHandler:^(
-      NSURLSessionWebSocketMessage *msg, NSError *error) {
-    NativeOrderbookEngine *s = weakSelf;
-    if (!s) return;
+  [_wsTask receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *error) {
+    NativeOrderbookEngine *self = weakSelf;
+    if (!self) return;
 
     if (error) {
-      NSLog(@"[ws-native] error: %@", error.localizedDescription);
-      [s _handleDisconnect];
+      NSLog(@"[TurboBook] WebSocket error: %@", error.localizedDescription);
+      [self handleDisconnect];
       return;
     }
 
-    NSString *text = nil;
-    if (msg.type == NSURLSessionWebSocketMessageTypeString) {
-      text = msg.string;
-    } else if (msg.type == NSURLSessionWebSocketMessageTypeData) {
-      text = [[NSString alloc] initWithData:msg.data encoding:NSUTF8StringEncoding];
-    }
-    if (text) [s _handleMessage:text];
+    NSString *text = (msg.type == NSURLSessionWebSocketMessageTypeString)
+        ? msg.string
+        : [[NSString alloc] initWithData:msg.data encoding:NSUTF8StringEncoding];
 
-    [s _receiveNext];
+    if (text) [self handleMessage:text];
+    [self receiveNextMessage];  // keep listening
   }];
 }
 
-- (void)_sendSubscribeAll {
+// Send a subscribe request for every symbol
+- (void)subscribeAll {
   for (NSString *symbol in _symbols) {
     NSDictionary *sub = @{
       @"event":   @"subscribe",
@@ -228,114 +210,104 @@ RCT_EXPORT_MODULE(OrderbookEngine)
       @"freq":    _freq,
       @"len":     _len,
     };
-    NSData   *data = [NSJSONSerialization dataWithJSONObject:sub options:0 error:nil];
-    NSString *str  = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    [_wsTask sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:str]
-       completionHandler:^(NSError *e) {
-      if (e) NSLog(@"[ws-native] subscribe error for %@: %@", symbol, e.localizedDescription);
-    }];
+    NSString *json = [[NSString alloc] initWithData:
+        [NSJSONSerialization dataWithJSONObject:sub options:0 error:nil]
+        encoding:NSUTF8StringEncoding];
+    [_wsTask sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:json]
+       completionHandler:^(NSError *e) {}];
   }
 }
 
-- (void)_handleMessage:(NSString *)text {
-  NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-  id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+// All incoming messages come here
+- (void)handleMessage:(NSString *)text {
+  id json = [NSJSONSerialization JSONObjectWithData:
+      [text dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
   if (!json) return;
 
-  // ── Event object ──────────────────────────────────────────────
+  // ── Event (dictionary) ─────────────────────────────────────────
   if ([json isKindOfClass:[NSDictionary class]]) {
-    NSDictionary *dict  = json;
-    NSString     *event = dict[@"event"];
+    NSString *event = json[@"event"];
 
     if ([event isEqualToString:@"info"]) {
-      // Bitfinex sends info first — subscribe all symbols now
-      NSLog(@"[ws-native] connected, subscribing %lu symbols...",
-            (unsigned long)_symbols.count);
-      [self _sendSubscribeAll];
-      return;
+      // Bitfinex sends "info" first when the connection opens.
+      // We subscribe here, not on socket open, because Bitfinex requires this order.
+      NSLog(@"[TurboBook] Connected — subscribing to %lu symbols", (unsigned long)_symbols.count);
+      [self subscribeAll];
     }
 
-    if ([event isEqualToString:@"subscribed"] &&
-        [dict[@"channel"] isEqualToString:@"book"]) {
-      int64_t   chanId = [dict[@"chanId"] longLongValue];
-      NSString *symNS  = dict[@"symbol"];
-      std::string sym  = symNS.UTF8String;
+    if ([event isEqualToString:@"subscribed"] && [json[@"channel"] isEqualToString:@"book"]) {
+      int64_t   chanId = [json[@"chanId"] longLongValue];
+      NSString *sym    = json[@"symbol"];
+      _chanIdToSymbol[chanId] = sym.UTF8String;
 
-      _chanIdToSymbol[chanId] = sym;
+      [_lock lock];
+      _connected[sym.UTF8String] = true;
+      _reconnectDelay = 2;  // reset backoff — we got a successful subscription
+      [_lock unlock];
 
-      [_stateLock lock];
-      _stats[sym].subscribed  = true;
-      _reconnectDelay         = 2;  // reset backoff on any successful sub
-      [_stateLock unlock];
-
-      NSLog(@"[ws-native] subscribed %@ chanId=%lld", symNS, chanId);
+      NSLog(@"[TurboBook] Subscribed to %@ (chanId %lld)", sym, chanId);
     }
     return;
   }
 
-  // ── Array message: [chanId, payload] ──────────────────────────
+  // ── Data (array: [chanId, payload]) ───────────────────────────
   if (![json isKindOfClass:[NSArray class]]) return;
   NSArray *arr = json;
   if (arr.count < 2) return;
 
   int64_t chanId = [arr[0] longLongValue];
-  auto chanIt = _chanIdToSymbol.find(chanId);
-  if (chanIt == _chanIdToSymbol.end()) return;
-  const std::string &sym = chanIt->second;
+  auto it = _chanIdToSymbol.find(chanId);
+  if (it == _chanIdToSymbol.end()) return;
+  const std::string &sym = it->second;
 
-  [_stateLock lock];
+  // Heartbeat — nothing to do
+  if ([arr[1] isKindOfClass:[NSString class]] && [arr[1] isEqualToString:@"hb"]) return;
+
+  // Get the engine for this symbol
+  [_lock lock];
   auto engineIt = _engines.find(sym);
   std::shared_ptr<turbobook::OrderbookEngine> engine;
   if (engineIt != _engines.end()) engine = engineIt->second;
-  [_stateLock unlock];
-
+  [_lock unlock];
   if (!engine) return;
 
-  id payload = arr[1];
-  if ([payload isKindOfClass:[NSString class]] &&
-      [(NSString *)payload isEqualToString:@"hb"]) return;
+  NSArray *payload = arr[1];
+  if (![payload isKindOfClass:[NSArray class]]) return;
 
-  // ── Snapshot ──────────────────────────────────────────────────
-  if ([payload isKindOfClass:[NSArray class]] &&
-      [(NSArray *)payload count] > 0 &&
-      [((NSArray *)payload)[0] isKindOfClass:[NSArray class]]) {
-
-    NSArray<NSArray *> *rows = payload;
+  // ── Snapshot: array of arrays [[price, count, amount], ...] ───
+  if ([payload[0] isKindOfClass:[NSArray class]]) {
     std::vector<std::tuple<double, int, double>> entries;
-    entries.reserve(rows.count);
-    for (NSArray *row in rows) {
+    for (NSArray *row in payload) {
       if (row.count < 3) continue;
       entries.emplace_back([row[0] doubleValue], [row[1] intValue], [row[2] doubleValue]);
     }
     engine->processSnapshot(entries);
 
-    [_stateLock lock];
-    _stats[sym].totalUpdates += (int64_t)rows.count;
-    [_stateLock unlock];
+    [_lock lock];
+    _updateCounts[sym] += (int64_t)payload.count;
+    [_lock unlock];
     return;
   }
 
-  // ── Delta ─────────────────────────────────────────────────────
-  if ([payload isKindOfClass:[NSArray class]] &&
-      [(NSArray *)payload count] >= 3 &&
-      [((NSArray *)payload)[0] isKindOfClass:[NSNumber class]]) {
+  // ── Delta: flat array [price, count, amount] ───────────────────
+  if (payload.count >= 3 && [payload[0] isKindOfClass:[NSNumber class]]) {
+    engine->processDelta([payload[0] doubleValue], [payload[1] intValue], [payload[2] doubleValue]);
 
-    NSArray *row = payload;
-    engine->processDelta([row[0] doubleValue], [row[1] intValue], [row[2] doubleValue]);
-
-    [_stateLock lock];
-    _stats[sym].totalUpdates++;
-    [_stateLock unlock];
+    [_lock lock];
+    _updateCounts[sym]++;
+    [_lock unlock];
   }
 }
 
-- (void)_handleDisconnect {
-  [_stateLock lock];
-  for (auto &kv : _stats) kv.second.subscribed = false;
-  BOOL shouldStop  = _disconnecting;
-  NSInteger delay  = _reconnectDelay;
-  _reconnectDelay  = MIN(_reconnectDelay * 2, 30);
-  [_stateLock unlock];
+// ── Reconnect with exponential backoff ─────────────────────────────────────
+
+- (void)handleDisconnect {
+  [_lock lock];
+  for (auto &kv : _connected) kv.second = false;
+  BOOL shouldStop    = _disconnecting;
+  NSInteger delay    = _reconnectDelay;
+  _reconnectDelay    = MIN(_reconnectDelay * 2, 30);  // 2 → 4 → 8 → 16 → 30s cap
+  [_lock unlock];
 
   [_wsTask cancel];
   _wsTask = nil;
@@ -343,14 +315,14 @@ RCT_EXPORT_MODULE(OrderbookEngine)
 
   if (shouldStop) return;
 
-  NSLog(@"[ws-native] disconnected, reconnecting in %lds...", (long)delay);
-  dispatch_after(
-      dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_SEC),
+  NSLog(@"[TurboBook] Disconnected — reconnecting in %lds", (long)delay);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_SEC),
       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
-      ^{ [self _openSocket]; });
+      ^{ [self openSocket]; });
 }
 
-// ── Codegen JSI bridge ────────────────────────────────────────────
+// ── TurboModule boilerplate ────────────────────────────────────────────────
+// This wires the class into the React Native New Architecture codegen system.
 
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
     (const facebook::react::ObjCTurboModule::InitParams &)params {
