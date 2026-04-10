@@ -1,38 +1,35 @@
 import { TurboModule, TurboModuleRegistry } from "react-native";
 
-/**
- * Pure C++ TurboModule for orderbook processing.
- * Registered via registerCxxModuleToGlobalModuleMap (no codegen).
- */
 export interface Spec extends TurboModule {
   /**
-   * Process a full orderbook snapshot.
-   * @param data Flat array: [price, count, amount, price, count, amount, ...]
+   * Open ONE native WebSocket and subscribe to multiple symbols simultaneously.
+   * symbols e.g. ["tBTCUSD", "tETHUSD", "tXRPUSD"]
    */
-  processSnapshot(data: number[]): void;
+  connectMulti(symbols: string[], prec: string, freq: string, len: string): void;
+
+  /** Close the WebSocket and tear down all engines. */
+  disconnect(): void;
 
   /**
-   * Process a single delta update.
-   * count=0 → delete (amount=1 bid, amount=-1 ask)
-   * count>0 → upsert (amount>0 bid, amount<0 ask)
+   * Get top N levels for a specific symbol as a flat array.
+   * Format: [bidCount, askCount, p,c,a,t per bid..., p,c,a,t per ask...]
    */
-  processDelta(price: number, count: number, amount: number): void;
-
-  /** Clear all levels from both sides. */
-  reset(): void;
+  getTopLevels(symbol: string, n: number): number[];
 
   /**
-   * Get top N levels from each side, pre-sorted with cumulative totals.
-   * Returns { bids: number[][], asks: number[][] }
-   * Each row: [price, count, amount, cumulativeTotal]
+   * Internal timing breakdown for a specific symbol.
+   * mapTraversalUs: C++ std::map iteration time
+   * arrayBuildUs:   ObjC NSMutableArray construction time
+   * totalUpdates:   cumulative WS updates for this symbol
    */
-  getTopLevels(n: number): {
-    bids: number[][];
-    asks: number[][];
+  getTimings(symbol: string): {
+    mapTraversalUs: number;
+    arrayBuildUs: number;
+    totalUpdates: number;
   };
 
-  /** CRC32 checksum matching Bitfinex format. */
-  getChecksum(): number;
+  /** True if this symbol is subscribed and receiving data. */
+  isConnected(symbol: string): boolean;
 }
 
 export default TurboModuleRegistry.get<Spec>("OrderbookEngine") as Spec | null;

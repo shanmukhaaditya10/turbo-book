@@ -1,5 +1,6 @@
 #include "OrderbookEngine.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
@@ -111,10 +112,13 @@ static std::vector<LevelWithTotal> extractTopImpl(
 
 TopLevels OrderbookEngine::getTopLevels(int n) const {
   std::lock_guard<std::mutex> lock(mu_);
-  return {
-      extractTopImpl(bids_, n),
-      extractTopImpl(asks_, n),
-  };
+  auto t0 = std::chrono::steady_clock::now();
+  auto bids = extractTopImpl(bids_, n);
+  auto asks = extractTopImpl(asks_, n);
+  auto t1 = std::chrono::steady_clock::now();
+  int64_t traversalUs =
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  return {std::move(bids), std::move(asks), traversalUs};
 }
 
 uint32_t OrderbookEngine::getChecksum() const {

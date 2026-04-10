@@ -1,292 +1,276 @@
-import { View, Text, ScrollView, Pressable, Alert } from "react-native";
-import { StatusBar } from "expo-status-bar";
-import { useMemo } from "react";
 import {
-  useOrderbook,
+  View,
+  Text,
+  ScrollView,
+  Switch,
+  Pressable,
+  Alert,
+} from "react-native";
+import { StatusBar } from "expo-status-bar";
+import { useState, useMemo } from "react";
+
+import {
+  useMultiOrderbook,
   formatPrice,
   formatAmount,
-  formatTotal,
-  getPerfTracker,
   type OrderbookEntry,
+  type OrderbookState,
 } from "../lib/orderbook-native";
+import { useOrderbook } from "../lib/orderbook";
 
-const DEPTH = 20;
+// ── Constants ──────────────────────────────────────────────────────
 
-function DepthRow({
+const SYMBOLS = ["tBTCUSD", "tETHUSD", "tXRPUSD"];
+const LABELS: Record<string, string> = {
+  tBTCUSD: "BTC/USD",
+  tETHUSD: "ETH/USD",
+  tXRPUSD: "XRP/USD",
+};
+const DEPTH = 7;
+
+// ── Single JS orderbook panel (3 separate WebSockets) ─────────────
+
+function JSBookPanel({ symbol }: { symbol: string }) {
+  const book = useOrderbook(symbol, "P0", DEPTH);
+  return <BookPanel label={LABELS[symbol]} book={book} mode="JS" />;
+}
+
+// ── Native multi-book consumer ─────────────────────────────────────
+
+function NativeBookPanel({
+  symbol,
+  books,
+}: {
+  symbol: string;
+  books: Record<string, OrderbookState>;
+}) {
+  const book = books[symbol] ?? {
+    bids: [],
+    asks: [],
+    spread: 0,
+    spreadPercent: 0,
+    connected: false,
+    perf: { updatesPerSec: 0, rendersPerSec: 0, totalUpdates: 0, avgGetTopLevelsUs: 0, avgFlushTimeUs: 0 },
+  };
+  return <BookPanel label={LABELS[symbol]} book={book} mode="NATIVE" />;
+}
+
+// ── Shared book panel ──────────────────────────────────────────────
+
+function PriceRow({
   entry,
-  maxTotal,
   side,
+  maxTotal,
 }: {
   entry: OrderbookEntry;
-  maxTotal: number;
   side: "bid" | "ask";
+  maxTotal: number;
 }) {
   const pct = maxTotal > 0 ? (entry.total / maxTotal) * 100 : 0;
-  const barColor =
-    side === "bid" ? "rgba(34,197,94,0.12)" : "rgba(239,68,68,0.12)";
+  const barColor = side === "bid" ? "#16a34a22" : "#dc262622";
   const priceColor = side === "bid" ? "#4ade80" : "#f87171";
 
   return (
-    <View
-      style={{
-        flexDirection: "row",
-        alignItems: "center",
-        height: 32,
-        paddingHorizontal: 12,
-      }}
-    >
+    <View style={{ flexDirection: "row", alignItems: "center", height: 22, position: "relative" }}>
       <View
         style={{
           position: "absolute",
           right: 0,
           top: 0,
           bottom: 0,
-          width: `${pct}%` as any,
+          width: `${pct}%`,
           backgroundColor: barColor,
         }}
       />
-      <Text
-        style={{
-          color: priceColor,
-          fontSize: 14,
-          fontVariant: ["tabular-nums"],
-          flex: 1,
-          fontWeight: "600",
-        }}
-      >
+      <Text style={{ flex: 1, color: priceColor, fontSize: 11, fontVariant: ["tabular-nums"], fontWeight: "600" }}>
         {formatPrice(entry.price)}
       </Text>
-      <Text
-        style={{
-          color: "#e5e7eb",
-          fontSize: 13,
-          fontVariant: ["tabular-nums"],
-          flex: 1,
-          textAlign: "right",
-        }}
-      >
+      <Text style={{ flex: 1, color: "#9ca3af", fontSize: 10, fontVariant: ["tabular-nums"], textAlign: "right" }}>
         {formatAmount(entry.amount)}
-      </Text>
-      <Text
-        style={{
-          color: "#9ca3af",
-          fontSize: 13,
-          fontVariant: ["tabular-nums"],
-          flex: 1,
-          textAlign: "right",
-        }}
-      >
-        {formatTotal(entry.total)}
-      </Text>
-      <Text
-        style={{
-          color: "#6b7280",
-          fontSize: 12,
-          fontVariant: ["tabular-nums"],
-          width: 36,
-          textAlign: "right",
-        }}
-      >
-        {entry.count}
       </Text>
     </View>
   );
 }
 
-export default function Index() {
-  const book = useOrderbook("tBTCUSD", "P0", DEPTH);
-  const { perf } = book;
+function BookPanel({
+  label,
+  book,
+  mode,
+}: {
+  label: string;
+  book: OrderbookState;
+  mode: "JS" | "NATIVE";
+}) {
+  const maxBidTotal = book.bids[book.bids.length - 1]?.total ?? 1;
+  const maxAskTotal = book.asks[book.asks.length - 1]?.total ?? 1;
 
-  const maxBidTotal = book.bids[book.bids.length - 1]?.total ?? 0;
-  const maxAskTotal = book.asks[book.asks.length - 1]?.total ?? 0;
-  const reversedAsks = useMemo(() => [...book.asks].reverse(), [book.asks]);
-
-  const bestBid = book.bids[0]?.price ?? 0;
-  const bestAsk = book.asks[0]?.price ?? 0;
-  const midPrice = (bestBid + bestAsk) / 2;
-
-  const dumpReport = () => {
-    const tracker = getPerfTracker();
-    if (tracker) {
-      const report = tracker.generateReport();
-      console.log("\n=== BENCHMARK REPORT ===\n" + report);
-      Alert.alert("Benchmark Logged", "Report printed to console. Copy from Metro terminal.");
-    }
-  };
+  const perf = book.perf as any;
+  const upsLabel = perf.updatesPerSec ?? 0;
+  const totalUp  = perf.totalUpdates ?? 0;
+  const jsTime   = mode === "JS"
+    ? ((perf.avgProcessTimeUs ?? 0) + (perf.avgFlushTimeUs ?? 0)).toFixed(0)
+    : ((perf.avgGetTopLevelsUs ?? 0) + (perf.avgFlushTimeUs ?? 0)).toFixed(0);
 
   return (
-    <View className="flex-1 bg-gray-950 pt-14">
+    <View
+      style={{
+        backgroundColor: "#0f172a",
+        borderRadius: 12,
+        padding: 10,
+        marginBottom: 10,
+        borderWidth: 1,
+        borderColor: book.connected ? "#1e3a5f" : "#374151",
+      }}
+    >
+      {/* Header */}
+      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <Text style={{ color: "#e2e8f0", fontWeight: "700", fontSize: 13 }}>{label}</Text>
+        <View style={{ flexDirection: "row", gap: 8, alignItems: "center" }}>
+          <Text style={{ color: "#94a3b8", fontSize: 10 }}>
+            {upsLabel} upd/s · {jsTime}μs
+          </Text>
+          <View style={{
+            width: 7, height: 7, borderRadius: 4,
+            backgroundColor: book.connected ? "#22c55e" : "#ef4444",
+          }} />
+        </View>
+      </View>
+
+      {/* Spread */}
+      {book.spread > 0 && (
+        <Text style={{ color: "#facc15", fontSize: 9, textAlign: "center", marginBottom: 4 }}>
+          spread ${formatPrice(book.spread)} ({book.spreadPercent.toFixed(4)}%)
+        </Text>
+      )}
+
+      {/* Column headers */}
+      <View style={{ flexDirection: "row", marginBottom: 2 }}>
+        <Text style={{ flex: 1, color: "#475569", fontSize: 9 }}>PRICE</Text>
+        <Text style={{ flex: 1, color: "#475569", fontSize: 9, textAlign: "right" }}>SIZE</Text>
+      </View>
+
+      {/* Asks (reversed: lowest ask at bottom, closest to spread) */}
+      {[...book.asks].reverse().map((e, i) => (
+        <PriceRow key={`a${i}`} entry={e} side="ask" maxTotal={maxAskTotal} />
+      ))}
+
+      {/* Spread divider */}
+      <View style={{ height: 1, backgroundColor: "#1e293b", marginVertical: 3 }} />
+
+      {/* Bids */}
+      {book.bids.map((e, i) => (
+        <PriceRow key={`b${i}`} entry={e} side="bid" maxTotal={maxBidTotal} />
+      ))}
+
+      {/* Footer */}
+      <Text style={{ color: "#334155", fontSize: 8, marginTop: 4, textAlign: "right" }}>
+        {totalUp.toLocaleString()} total updates
+      </Text>
+    </View>
+  );
+}
+
+// ── Native container (one hook manages all 3 books) ───────────────
+
+function NativeBooks() {
+  const books = useMultiOrderbook(SYMBOLS, DEPTH);
+  return (
+    <>
+      {SYMBOLS.map((sym) => (
+        <NativeBookPanel key={sym} symbol={sym} books={books} />
+      ))}
+    </>
+  );
+}
+
+// ── JS container (3 independent hooks = 3 WebSockets) ─────────────
+
+function JSBooks() {
+  return (
+    <>
+      {SYMBOLS.map((sym) => (
+        <JSBookPanel key={sym} symbol={sym} />
+      ))}
+    </>
+  );
+}
+
+// ── Root ───────────────────────────────────────────────────────────
+
+export default function App() {
+  const [useNative, setUseNative] = useState(true);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: "#020817" }}>
       <StatusBar style="light" />
 
       {/* Header */}
-      <View className="px-4 pb-2">
-        <View className="flex-row items-center justify-between">
-          <View>
-            <Text className="text-white text-2xl font-bold">BTC/USD</Text>
-            <Text className="text-gray-400 text-sm mt-0.5">
-              Bitfinex Orderbook
-            </Text>
-          </View>
-          <View className="items-end">
-            <Text className="text-white text-xl font-semibold">
-              {midPrice > 0 ? formatPrice(midPrice) : "---"}
-            </Text>
-            <View className="flex-row items-center mt-1">
-              <View
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: 4,
-                  backgroundColor: book.connected ? "#22c55e" : "#ef4444",
-                  marginRight: 6,
-                }}
-              />
-              <Text
-                style={{
-                  color: book.connected ? "#22c55e" : "#ef4444",
-                  fontSize: 12,
-                  fontWeight: "700",
-                }}
-              >
-                {book.connected ? "LIVE WS" : "CONNECTING..."}
-              </Text>
-            </View>
-          </View>
-        </View>
-
-        {/* Stats row 1 */}
-        <View className="flex-row mt-3" style={{ gap: 8 }}>
-          <View className="flex-1 bg-gray-900/80 rounded-xl px-3 py-2">
-            <Text style={{ color: "#9ca3af", fontSize: 10 }}>SPREAD</Text>
-            <Text
-              style={{ color: "#facc15", fontSize: 14, fontWeight: "700", fontVariant: ["tabular-nums"], marginTop: 2 }}
-            >
-              {book.spread > 0 ? `$${formatPrice(book.spread)}` : "---"}
-            </Text>
-          </View>
-          <View className="flex-1 bg-gray-900/80 rounded-xl px-3 py-2">
-            <Text style={{ color: "#9ca3af", fontSize: 10 }}>UPD/SEC</Text>
-            <Text
-              style={{ color: "#22d3ee", fontSize: 14, fontWeight: "700", fontVariant: ["tabular-nums"], marginTop: 2 }}
-            >
-              {perf.updatesPerSec}
-            </Text>
-          </View>
-          <View className="flex-1 bg-gray-900/80 rounded-xl px-3 py-2">
-            <Text style={{ color: "#9ca3af", fontSize: 10 }}>RENDERS/S</Text>
-            <Text
-              style={{ color: "#a78bfa", fontSize: 14, fontWeight: "700", fontVariant: ["tabular-nums"], marginTop: 2 }}
-            >
-              {perf.rendersPerSec}
-            </Text>
-          </View>
-        </View>
-
-        {/* Stats row 2 — perf timings */}
-        <View className="flex-row mt-2" style={{ gap: 8 }}>
-          <View className="flex-1 bg-gray-900/80 rounded-xl px-3 py-2">
-            <Text style={{ color: "#9ca3af", fontSize: 10 }}>PARSE</Text>
-            <Text
-              style={{ color: "#fb923c", fontSize: 13, fontWeight: "600", fontVariant: ["tabular-nums"], marginTop: 2 }}
-            >
-              {perf.avgParseTimeUs.toFixed(0)}μs
-            </Text>
-            <Text style={{ color: "#6b7280", fontSize: 9, marginTop: 1 }}>
-              peak {perf.maxParseTimeUs.toFixed(0)}μs
-            </Text>
-          </View>
-          <View className="flex-1 bg-gray-900/80 rounded-xl px-3 py-2">
-            <Text style={{ color: "#9ca3af", fontSize: 10 }}>PROCESS</Text>
-            <Text
-              style={{ color: "#fb923c", fontSize: 13, fontWeight: "600", fontVariant: ["tabular-nums"], marginTop: 2 }}
-            >
-              {perf.avgProcessTimeUs.toFixed(0)}μs
-            </Text>
-            <Text style={{ color: "#6b7280", fontSize: 9, marginTop: 1 }}>
-              peak {perf.maxProcessTimeUs.toFixed(0)}μs
-            </Text>
-          </View>
-          <View className="flex-1 bg-gray-900/80 rounded-xl px-3 py-2">
-            <Text style={{ color: "#9ca3af", fontSize: 10 }}>FLUSH</Text>
-            <Text
-              style={{ color: "#fb923c", fontSize: 13, fontWeight: "600", fontVariant: ["tabular-nums"], marginTop: 2 }}
-            >
-              {perf.avgFlushTimeUs.toFixed(0)}μs
-            </Text>
-            <Text style={{ color: "#6b7280", fontSize: 9, marginTop: 1 }}>
-              peak {perf.maxFlushTimeUs.toFixed(0)}μs
-            </Text>
-          </View>
-        </View>
-
-        {/* Benchmark button */}
-        <Pressable
-          onPress={dumpReport}
-          style={{
-            marginTop: 8,
-            backgroundColor: "#1e293b",
-            borderRadius: 8,
-            paddingVertical: 8,
-            alignItems: "center",
-            borderWidth: 1,
-            borderColor: "#334155",
-          }}
-        >
-          <Text style={{ color: "#94a3b8", fontSize: 12, fontWeight: "600" }}>
-            DUMP BENCHMARK TO CONSOLE
-          </Text>
-        </Pressable>
-      </View>
-
-      {/* Column headers */}
       <View
         style={{
-          flexDirection: "row",
-          paddingHorizontal: 12,
-          paddingVertical: 8,
+          paddingTop: 56,
+          paddingHorizontal: 16,
+          paddingBottom: 12,
           borderBottomWidth: 1,
-          borderBottomColor: "#374151",
+          borderBottomColor: "#1e293b",
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "space-between",
         }}
       >
-        <Text style={{ color: "#9ca3af", fontSize: 11, flex: 1, fontWeight: "600" }}>
-          PRICE
-        </Text>
-        <Text style={{ color: "#9ca3af", fontSize: 11, flex: 1, textAlign: "right", fontWeight: "600" }}>
-          SIZE (BTC)
-        </Text>
-        <Text style={{ color: "#9ca3af", fontSize: 11, flex: 1, textAlign: "right", fontWeight: "600" }}>
-          TOTAL
-        </Text>
-        <Text style={{ color: "#9ca3af", fontSize: 11, width: 36, textAlign: "right", fontWeight: "600" }}>
-          CNT
-        </Text>
-      </View>
-
-      {/* Orderbook */}
-      <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
-        {reversedAsks.map((entry) => (
-          <DepthRow key={`a-${entry.price}`} entry={entry} maxTotal={maxAskTotal} side="ask" />
-        ))}
-
-        <View
-          style={{
-            flexDirection: "row",
-            alignItems: "center",
-            justifyContent: "center",
-            paddingVertical: 10,
-            borderTopWidth: 1,
-            borderBottomWidth: 1,
-            borderColor: "#374151",
-          }}
-        >
-          <Text style={{ color: "#facc15", fontSize: 13, fontWeight: "700", fontVariant: ["tabular-nums"] }}>
-            SPREAD ${book.spread > 0 ? formatPrice(book.spread) : "---"}
+        <View>
+          <Text style={{ color: "#f8fafc", fontSize: 18, fontWeight: "800" }}>
+            TurboBook
+          </Text>
+          <Text style={{ color: "#64748b", fontSize: 11, marginTop: 1 }}>
+            {SYMBOLS.map((s) => LABELS[s]).join(" · ")}
           </Text>
         </View>
 
-        {book.bids.map((entry) => (
-          <DepthRow key={`b-${entry.price}`} entry={entry} maxTotal={maxBidTotal} side="bid" />
-        ))}
+        {/* JS / NATIVE toggle */}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <Text style={{ color: useNative ? "#475569" : "#22d3ee", fontSize: 12, fontWeight: "600" }}>
+            JS
+          </Text>
+          <Switch
+            value={useNative}
+            onValueChange={setUseNative}
+            thumbColor={useNative ? "#6366f1" : "#22d3ee"}
+            trackColor={{ false: "#1e3a5f", true: "#312e81" }}
+          />
+          <Text style={{ color: useNative ? "#818cf8" : "#475569", fontSize: 12, fontWeight: "600" }}>
+            NATIVE
+          </Text>
+        </View>
+      </View>
+
+      {/* Mode badge */}
+      <View style={{ paddingHorizontal: 16, paddingTop: 8 }}>
+        <View
+          style={{
+            backgroundColor: useNative ? "#1e1b4b" : "#0c2240",
+            borderRadius: 8,
+            padding: 8,
+            flexDirection: "row",
+            justifyContent: "space-between",
+          }}
+        >
+          <Text style={{ color: useNative ? "#818cf8" : "#38bdf8", fontSize: 11, fontWeight: "700" }}>
+            {useNative
+              ? "C++ TurboModule · 1 native WS · 3 engines"
+              : "Pure JS · 3 WebSockets · Map + sort per update"}
+          </Text>
+          <Text style={{ color: "#475569", fontSize: 10 }}>
+            depth {DEPTH}
+          </Text>
+        </View>
+      </View>
+
+      {/* Books */}
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ padding: 16, paddingBottom: 32 }}
+      >
+        {useNative ? <NativeBooks /> : <JSBooks />}
       </ScrollView>
     </View>
   );

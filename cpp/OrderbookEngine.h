@@ -23,6 +23,7 @@ struct LevelWithTotal {
 struct TopLevels {
   std::vector<LevelWithTotal> bids;
   std::vector<LevelWithTotal> asks;
+  int64_t traversalUs;  // microseconds spent inside extractTopImpl (both sides)
 };
 
 class OrderbookEngine {
